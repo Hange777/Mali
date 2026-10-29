@@ -45,8 +45,9 @@
 extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 // The display driver's GPU hand-off (drivers/GopFramebuffer/NativeGOPPresenter.cpp, linked with the display archive only): the render server's
 // presenter reaches it through its connection to this driver, because the sandbox lets it open the accelerator and not the presenter's service.
-extern "C" IOReturn native_gop_handoff_call(uint32_t op, task_t task, const void *in, size_t inSize, void *out, size_t outSize) __attribute__((weak_import));
-extern "C" IOMemoryDescriptor *native_gop_handoff_memory(void) __attribute__((weak_import));
+// Weak fallbacks keep a kernel that links this driver without the display archive linkable; the display driver's strong definitions replace them.
+extern "C" __attribute__((weak)) IOReturn native_gop_handoff_call(uint32_t, task_t, const void *, size_t, void *, size_t) { return kIOReturnUnsupported; }
+extern "C" __attribute__((weak)) IOMemoryDescriptor *native_gop_handoff_memory(void) { return nullptr; }
 
 namespace {
 
