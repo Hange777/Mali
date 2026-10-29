@@ -117,17 +117,44 @@ bool powerDomainOn() {
   return true;
 }
 
+// RK3588 PLL (the vendor driver's pll_rk3588): rate = 24 MHz * (m + k / 65536) / p / 2^s with CON0 m [9:0], CON1 p [5:0] s [8:6] and power-down bit 13,
+// CON2 k [15:0], CON6 lock bit 15. `con` is the index of CON0 (CRU offset 4 * con).
+struct Pll { const char *name; unsigned con; };
+constexpr Pll kPlls[] = { {"gpll", 112}, {"cpll", 104}, {"aupll", 96}, {"npll", 120}, {"v0pll", 88} };   // the first four are clk_gpu_src's mux inputs 0..3
+
+uint64_t pllKHz(unsigned con) {
+  const uint32_t c0 = gCru[con], c1 = gCru[con + 1], c2 = gCru[con + 2];
+  const uint64_t m = c0 & 0x3ff, p = c1 & 0x3f, s = (c1 >> 6) & 7, k = c2 & 0xffff;
+  if (!p || (c1 & (1u << 13))) return 0;   // no divider, or powered down
+  return ((24000ull * (m * 65536 + k)) / 65536 / p) >> s;
+}
+
+bool pllLocked(unsigned con) { return (gCru[con + 6] & (1u << 15)) != 0; }
+
 void setClocks() {
   unsigned div = 5;
   PE_parse_boot_argn("mali-div", &div, sizeof div);
   if (div > 31) div = 5;
+  // mali-pll=N picks clk_gpu_src's source: 0 GPLL (the default: 1188 MHz, so mali-div=1 is 594 MHz and 5 is 198), 1 CPLL, 2 AUPLL, 3 NPLL.
+  // The GPU rail is 0.75 V (UEFI sets it); the vendor's operating-point table has 800 MHz at 0.75 V for the worst chips, and 900 MHz at 0.80 V.
+  unsigned source = 0;
+  PE_parse_boot_argn("mali-pll", &source, sizeof source);
+  if (source > 3) source = 0;
+  for (const Pll &pll : kPlls)
+    printf("mali: %s %llu kHz (locked %u; con %#x %#x %#x, status %#x)\n", pll.name, static_cast<unsigned long long>(pllKHz(pll.con)), pllLocked(pll.con) ? 1 : 0,
+           gCru[pll.con], gCru[pll.con + 1], gCru[pll.con + 2], gCru[pll.con + 6]);
+  if (source && (!pllKHz(kPlls[source].con) || !pllLocked(kPlls[source].con))) {
+    printf("mali: %s is not running or not locked: staying on gpll\n", kPlls[source].name);
+    source = 0;
+  }
   printf("mali: clocks before: sel158 %#x gate66 %#x\n", gCru[kCruSel158 / 4], gCru[kCruGate66 / 4]);
-  gCru[kCruSel158 / 4] = (0xffu << 16) | (0u << 5) | div;                          // GPLL / (div + 1)
+  gCru[kCruSel158 / 4] = (0xffu << 16) | (source << 5) | div;                      // PLL / (div + 1)
   gCru[kCruGate66 / 4] = ((1u << 1 | 1u << 4 | 1u << 6 | 1u << 7) << 16);          // ungate the four GPU clocks
   __asm__ volatile("dsb sy" ::: "memory");
-  printf("mali: clocks now:    sel158 %#x gate66 %#x (GPLL / %u)\n", gCru[kCruSel158 / 4], gCru[kCruGate66 / 4], div + 1);
-  // clk_gpu_stacks (CLKSEL_CON(159) = 0x57c, divider bits 4:0 of clk_gpu_src): the frames take the same time at 198 and at 594 MHz, so something
-  // else sets their pace. mali-stacks=N sets that divider (minus one); without it the register is only reported.
+  printf("mali: clocks now:    sel158 %#x gate66 %#x (%s / %u = %llu kHz)\n", gCru[kCruSel158 / 4], gCru[kCruGate66 / 4], kPlls[source].name, div + 1,
+         static_cast<unsigned long long>(pllKHz(kPlls[source].con) / (div + 1)));
+  // clk_gpu_stacks (CLKSEL_CON(159) = 0x57c, divider bits 4:0 of clk_gpu_src): mali-stacks=N sets that divider (minus one); without it the register is
+  // only reported.
   unsigned stacks = 99;
   PE_parse_boot_argn("mali-stacks", &stacks, sizeof stacks);
   const uint32_t before159 = gCru[0x57c / 4];
@@ -158,6 +185,61 @@ void identify() {
   printf("mali: present: shader %#x tiler %#x l2 %#x stack %#x; threads %u features %#x; coherency features %#x\n", gpu(kShaderPresent),
          gpu(kTilerPresent), gpu(kL2Present), gpu(kStackPresent), gpu(kThreadMax), gpu(kThreadFeatures), gpu(kCoherencyFeatures));
   printf("mali: MCU control %#x status %#x, GPU status %#x, irq raw %#x\n", gpu(kMcuControl), gpu(kMcuStatus), gpu(kStatus), gpu(kIntRaw));
+}
+
+// The NoC's bandwidth and priority registers of the GPU's four AXI masters and of the VOP's two (Arteris QoS generator: +0x8 priority, +0xc mode, +0x10
+// bandwidth, +0x14 saturation, +0x18 extcontrol; the vendor's power-domain driver saves and restores these around a power cycle, and RK3588's shaping
+// registers sit at +0x88). Read after the GPU domain is on, they say whether something throttles the GPU's memory traffic.
+void dumpNoc() {
+  // mali-noc=0: nothing; 1 (the default): the GPU's four; 2: the VOP's two as well (they sit in the VOP's power domain: a read while it is off would hang).
+  unsigned which = 1;
+  PE_parse_boot_argn("mali-noc", &which, sizeof which);
+  struct Node { const char *name; uint64_t phys; };
+  static const Node nodes[] = { {"gpu m0", 0xfdf35000ULL}, {"gpu m1", 0xfdf35200ULL}, {"gpu m2", 0xfdf35400ULL}, {"gpu m3", 0xfdf35600ULL},
+                                {"vop m0", 0xfdf82000ULL}, {"vop m1", 0xfdf82200ULL} };
+  const unsigned count = which >= 2 ? 6 : which == 1 ? 4 : 0;
+  for (unsigned i = 0; i < count; ++i) {
+    const Node &n = nodes[i];
+    volatile uint32_t *r = reinterpret_cast<volatile uint32_t *>(ml_io_map(static_cast<vm_offset_t>(n.phys), 0x100));
+    if (!r) { printf("mali: noc %s: cannot map %#llx\n", n.name, static_cast<unsigned long long>(n.phys)); continue; }
+    printf("mali: noc %s %#llx: id %#x rev %#x prio %#x mode %#x bw %#x sat %#x ext %#x | %#x %#x %#x %#x %#x %#x %#x %#x (+0x80..+0x9c)\n", n.name,
+           static_cast<unsigned long long>(n.phys), r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[0x80 / 4], r[0x84 / 4], r[0x88 / 4], r[0x8c / 4],
+           r[0x90 / 4], r[0x94 / 4], r[0x98 / 4], r[0x9c / 4]);
+  }
+}
+
+// mali-poke=ADDR/VALUE[,ADDR/VALUE...]: 32-bit writes to physical addresses (hex, no 0x; boot-args take no ':') once, after the GPU domain is on, for
+// trying a register setting (NoC QoS, say) without rebuilding the kernel. Up to four, each reported before and after.
+void pokeRegisters() {
+  char text[96] = {};
+  if (!PE_parse_boot_argn("mali-poke", text, sizeof text) || !text[0]) return;
+  const char *c = text;
+  for (unsigned n = 0; n < 4 && *c; ++n) {
+    auto hex = [&c](uint64_t &out) {
+      out = 0;
+      bool any = false;
+      for (;; ++c) {
+        const char d = *c;
+        const unsigned v = d >= '0' && d <= '9' ? d - '0' : d >= 'a' && d <= 'f' ? d - 'a' + 10 : d >= 'A' && d <= 'F' ? d - 'A' + 10 : 99;
+        if (v == 99) break;
+        out = (out << 4) | v;
+        any = true;
+      }
+      return any;
+    };
+    uint64_t addr = 0, value = 0;
+    if (!hex(addr) || *c != '/') { printf("mali: poke: cannot read an address at \"%s\"\n", c); return; }
+    ++c;
+    if (!hex(value)) { printf("mali: poke: cannot read a value after %#llx\n", static_cast<unsigned long long>(addr)); return; }
+    if (*c == ',') ++c;
+    volatile uint32_t *page = reinterpret_cast<volatile uint32_t *>(ml_io_map(static_cast<vm_offset_t>(addr & ~0xfffULL), 0x1000));
+    if (!page || (addr & 3)) { printf("mali: poke: cannot map or align %#llx\n", static_cast<unsigned long long>(addr)); continue; }
+    volatile uint32_t *r = page + ((addr & 0xfff) >> 2);
+    const uint32_t before = *r;
+    *r = static_cast<uint32_t>(value);
+    __asm__ volatile("dsb sy" ::: "memory");
+    printf("mali: poke %#llx: %#x -> wrote %#x -> reads %#x\n", static_cast<unsigned long long>(addr), before, static_cast<uint32_t>(value), *r);
+  }
 }
 
 // Panthor's panthor_gpu_power_on(L2): ask for power, wait for READY. It proves that the GPU's own power state machine and clocks work.
@@ -2760,10 +2842,12 @@ extern "C" void mali_start(void) {
   PE_parse_boot_argn("mali-skipslot", &gSkipSlots, sizeof gSkipSlots);
   if (gSkipSlots) printf("mali: CSG slots %#x are not used (mali-skipslot)\n", gSkipSlots);
   if (l2) l2Test();
+  dumpNoc();
+  pokeRegisters();
   {
     // What clock the GPU really runs at: its cycle counter (GPU_COMMAND_TIME_ENABLE starts it) against the architected counter (24 MHz).
-    // CLKSEL_CON(158) said 198 MHz and 594 MHz gave the same frame times, so either something else is the bottleneck or this register is not
-    // the clock.
+    // CLKSEL_CON(158) is the clock (this probe reads 594 MHz at mali-div=1 and 198 at the default mali-div=5), and the heavy render passes scale with it
+    // exactly (28.4 ms at 594 MHz, 84.8 ms at 198 MHz, mali-trace=print): a frame's GPU time follows the clock, so mali-pll / mali-div are worth trying.
     auto cycles = [] { uint32_t hi = gpu(0x94), lo = gpu(0x90); const uint32_t hi2 = gpu(0x94); if (hi2 != hi) { hi = hi2; lo = gpu(0x90); } return (static_cast<uint64_t>(hi) << 32) | lo; };
     auto counter = [] { uint64_t v; __asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(v)); return v; };
     gpuWrite(kCmd, 0x103);
@@ -2777,8 +2861,8 @@ extern "C" void mali_start(void) {
            static_cast<unsigned long long>(us), static_cast<unsigned long long>(us ? (c1 - c0) / us : 0), gpu(0x9c), gpu(0x98));
   }
   {
-    // The CPU's own view of the memory system (cached write-back memory, 32 MiB, the kernel's physical aperture): a fill and a copy. The GPU
-    // draws a full-screen pass (8 MB written) in about 4 ms, which is 2 GB/s.
+    // The CPU's own view of the memory system (cached write-back memory, 32 MiB, the kernel's physical aperture): a fill and a copy. This board's DRAM
+    // is fast (about 50 GB/s fill, 20 GB/s copy), and up to 594 MHz the GPU's frame time follows the GPU's own clock, not the memory's.
     const size_t bytes = 32u << 20;
     IOBufferMemoryDescriptor *buffer = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, bytes * 2, 4096);
     if (buffer) {
