@@ -16,8 +16,8 @@ stack in [MaliMetal](https://github.com/Ken-u/MaliMetal) drives.
 
 ## Build
 
-The driver is one translation unit compiled against the XNU tree. `UniXNU-evb10`'s
-`scripts/build-arm-driver.py Mali` produces `build/mali/libMali.a`, which
+The driver is one translation unit compiled against the XNU tree. `UniXNU-evb10` carries it as `package/Mali`, and its
+`scripts/build-evb10-drivers.py Mali` produces `build/mali/libMali.a`, which
 `CONFIG_XNU_EXTRA_LD_ARCHIVES` force-loads. The board's display probe calls
 `mali_start()` when the boot argument `mali=N` is set.
 

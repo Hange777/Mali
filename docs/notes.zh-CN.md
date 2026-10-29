@@ -131,7 +131,7 @@ m2b PASSED: a shader ran on the shader cores and wrote memory
 ## M3b 实测（2026-10-28 18:45，`板子运行 m3b2，`mali=7`）
 
 内核里的 IOKit 服务 **`Mali`**（`OSDefineMetaClassAndStructors`，由 `mali_start()` 手工 `init/attach(IOResources)/start/registerService`，
-用户态用 `IOServiceMatching("MaliService")` 找）和它的 user client **`MaliClient`**。接口在 `drivers/Mali/mali_uapi.h`（C，垫片同用），
+用户态用 `IOServiceMatching("MaliService")` 找）和它的 user client **`MaliClient`**。接口在 `mali_uapi.h`（C，垫片同用），
 就是 Panthor uAPI 拆成不带用户指针的 10 个 selector（`DEV_QUERY / VM_CREATE / VM_DESTROY / BO_CREATE / BO_DESTROY / VM_BIND / GROUP_CREATE / GROUP_DESTROY / GROUP_SUBMIT / FENCE_WAIT`），
 全是 `IOConnectCallStructMethod`；内存用 `IOConnectMapMemory64(type = BO 句柄)`，type = `0x80000000 | group` 是那个 group 的 syncobj 页（只读）。垫片负责把 `DRM_IOCTL_PANTHOR_*` 里的数组摊平、一个元素一次调用。
 
@@ -185,7 +185,7 @@ vk-test: ALL OK (PanVK: instance, device, compute pipeline, dispatch, fence, rea
 | tiler heap | `Mali.cpp` `heapCreate/heapFree`，selector `HEAP_CREATE/HEAP_DESTROY` | 块按「新的在前」串起来（`header[0] = (上一块 & ~0xfff) \| (chunkSize >> 12)`）；句柄 = 槽号 + 1；**没有 OOM 处理（还没有中断）** |
 | libdrm 垫片 | `MaliMetal 的 darwin-drm/drm_darwin.c` | `drm_darwin_open_render()` 返回 /dev/null 的 fd；`drmIoctl` 按 Panthor 的 ioctl 号分发；syncobj（二进制 + timeline）、`VM_BIND`（先等再绑再放信号）、`GROUP_SUBMIT`（`dsb sy` 后提交，给每个 queue 挂 fence）、BO 映射走 `IOConnectMapMemory64`（WC）、偏移 ≥ 1<<43 的是 flush-id 页（给一页零）。`DRM_DARWIN_TRACE=1` 每个 ioctl 打一行 |
 | Mesa 补丁 | `MaliMetal 的 mesa-patches/0002-os-mman-darwin.patch`、`0003-panvk-apple-build-id.patch` | `os_mmap` 在 Darwin 改走垫片（MAP_FIXED 不支持）；Mach-O 的 LC_UUID 只有 16 字节，PanVK 要的 build-id 检查在 `__APPLE__` 放宽到 16 |
-| 文件投递 | `usertest/build.sh` → `drivers/Mali/gpu_files.inc`；`mali_exec_prepare()` | 三个文件（`gpu-test`、`libtiny.dylib`、`libvulkan_panfrost.dylib` 16.5 MB）以 zlib 流编进内核，开机时写到 Data 卷 `/private/var/evb10/`（0755）。**内核的 zlib 没有默认分配器（NO_ZCFUNCS）：`uncompress()` 会跳到 0 崩溃，`mali_inflate()` 自己给 `zalloc/zfree`** |
+| 文件投递 | `usertest/build.sh` → `Mali/gpu_files.inc`；`mali_exec_prepare()` | 三个文件（`gpu-test`、`libtiny.dylib`、`libvulkan_panfrost.dylib` 16.5 MB）以 zlib 流编进内核，开机时写到 Data 卷 `/private/var/evb10/`（0755）。**内核的 zlib 没有默认分配器（NO_ZCFUNCS）：`uncompress()` 会跳到 0 崩溃，`mali_inflate()` 自己给 `zalloc/zfree`** |
 | mmap 放行 | `xnu-patches/evb10-mmap-grant.patch` | exec 过 trust cache 的程序没问题，但 **Data 卷上任何文件 `mmap(PROT_EXEC)` 都是 EPERM**（dyld 报「file system sandbox blocked mmap()」；系统卷的文件没事）。`kern_mman.c` 里加钩子：路径在 `/private/var/evb10/` 且 `mali_exec_ready` 时放行 |
 | 沙盒放行 | `MaliService` 的属性 `NativeSandboxGrantProcess`（逗号分隔进程名，默认 `gpu-test`，boot-arg `mali-grant=` 可改） | PID 1 能 `IOServiceOpen`，**fork 出来的子进程被平台沙盒拒（`0xe00002e2` kIOReturnNotPermitted）**。UniXNU 给 Adreno 做的 `native_sandbox_grant` 就认这个属性（`IOUserClient.cpp`），不用改内核。**M4 时 backboardd / 渲染服务进程的名字要加进这个列表** |
 | CTR_EL0 | `xnu-patches/evb10-sctlr-uct.patch`（`SCTLR_EXTRA = SCTLR_UCT_ENABLED`） | Mesa 的 `util/cache_ops_aarch64.c` 在 EL0 读 `ctr_el0` 取缓存行大小；XNU 默认 `SCTLR_EL1.UCT=0` → **SIGILL**（`d53b0029` = `mrs x9, ctr_el0`）。Linux 也开这一位。A55/A76 缓存行都是 64 B，两种核读出来一样 |
