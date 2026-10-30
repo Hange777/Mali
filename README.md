@@ -34,7 +34,7 @@ listed in the device repository's `proprietary-files.txt`.
 `mali=N` selects how far the bring-up runs: 1 power and GPU_ID, 2 firmware and MCU, 3 command
 stream, 6 and 7 several groups, 8 the IOKit service with its user client. Further arguments tune
 behaviour and experiments: `mali-metal`, `mali-plugin`, `mali-plugin-grant` (which processes may
-open the user client), `mali-div`, `mali-stacks`, `mali-l2`, `mali-leaf`, `mali-sample`,
+open the user client), `mali-pll`, `mali-div`, `mali-npll` (the GPU clock), `mali-stacks`, `mali-l2`, `mali-leaf`, `mali-sample`,
 `mali-skipslot`, `mali-postflush`, `mali-grant`, `mali-blocks`, `mali-contig`, `mali-pool`.
 Each one is documented at its `PE_parse_boot_argn` call in `Mali.cpp`.
 
@@ -42,6 +42,7 @@ Each one is documented at its `PE_parse_boot_argn` call in `Mali.cpp`.
 
 Verified on the RK3588 EVB10 V10 (see its porting record): the driver brings the GPU up, runs
 compute and fragment jobs, and composites the iPadOS lock screen through PanVK and
-metal2vulkan. GPU clock is fixed at 594 MHz; there is no DVFS and no interrupt-driven
+metal2vulkan. The GPU clock is fixed for the whole run (198 MHz unless `mali-pll` / `mali-div` / `mali-npll` pick another source, divider
+or NPLL rate; 850 and 1000 MHz were run for the frame-rate work, which needs the GPU rail at 0.85 V from the UEFI); there is no DVFS and no interrupt-driven
 completion yet (waits poll). GPU interrupts, error reporting to user space and more than eight
 groups are open items.

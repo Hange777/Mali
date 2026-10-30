@@ -290,6 +290,15 @@ VOP 的窗口地址翻到这个面——面板扫到画了一半的面。`up3` �
    `mali-pll=1 mali-div=1`（本仓库 `aa7028f`）把 GPU 抬到 750 MHz（UEFI 设的 0.75 V，不升压）；调频本身仍没做。
 3. 减少采样的字节数：把影子图存成 8 位的实验没有改变帧时间（带宽不是瓶颈），已删。
 
+## GPU 时钟：`mali-pll`、`mali-npll`（2026-10-30，`板子运行 gp2`、`soak1`）
+
+`clk_gpu_src`（CLKSEL_CON(158)）的源：`mali-pll=0` GPLL（1188 MHz）、`1` CPLL（1500）、`2` AUPLL（786）、`3` NPLL（固件设的 850），`mali-div=N` 是分频减一。`mali-pll=3 mali-div=0` = 850 MHz。
+**`mali-npll=MHz`（400–1100）**：切到 NPLL 之前把它改成别的频率。只改乘数 M（CON0 [9:0]），P、S 保持固件的值：`rate = 24 MHz × M / P / 2^S`，固件是 M 425、P 3、S 2 = 850 MHz（VCO 3.4 GHz），
+1000 MHz = M 500（VCO 4 GHz，PLL 的范围 2.25–4.5 GHz，越界的不做）。写完等锁定位（CON6[15]）最多 5 ms，没锁住就恢复原来的 M。切换时 GPU 还在别的源上（驱动刚启动），NPLL 在这个系统里没有别的用户。
+板上（`gp2`）：`mali: mali-npll=1000: m 425 -> 500, npll now 1000000 kHz (locked 1, con 0x1f4 0x83)`，GPU 周期计数器探针读到 `1000 MHz`（21008038 个 GPU 周期 / 21008 µs）。
+**电压**：UEFI 把 `vdd_gpu_s0` 设成 0.85 V（`uefi-evb10` 的 `RockchipPlatformLib.c`，原来 0.75 V）；厂商的工作点表：800 MHz 0.75 V、900 MHz 0.80 V、1 GHz 0.85 V。驱动不调频，所以这根轨按「启动参数可能选的最高频率」一次设好。
+效果：命令缓冲的 GPU 时间中位数 9.1 → 7.9 ms（850 → 1000 MHz），提交→完成 p50 13.7 → 12.7 ms、p90 17.3 → 15.6 ms，超过一帧能给的 19.3 ms 的重命令缓冲 3.5 → 1.6 %（MaliMetal 仓库 `docs/notes.zh-CN.md`「帧率（二）」）。
+
 ## 风险（按大小）
 
 1. ~~PanVK 够不够 metal2vulkan 的 Vulkan 特性~~——纸面上够（M3-1），余下是 framebuffer-fetch 策略和 PanVK 真跑起来之后的编译耗时。
