@@ -305,7 +305,7 @@ VOP 的窗口地址翻到这个面——面板扫到画了一半的面。`up3` �
 2. ~~PanVK 在 iOS 上的构建~~——已打通（M3-3）。剩下的未知项是**运行时**：dylib 在 iOS 用户态能不能 `vkCreateInstance`、
    Mesa 里还有没有别的 Linux 假设（`memfd`、`/proc`、`/sys` 读取、`dup` 的 fd 语义）只在运行时才暴露。
 3. Panthor 依赖的 Linux 设施（DRM/GEM/dma_fence/io-pgtable/调度器）在 XNU 上都要自己写。
-4. 电压/时钟：目前跑在 198 MHz、PMIC 默认电压；SCMI 调频没做。
+4. 电压/时钟：驱动自己的默认是 198 MHz（没有 `mali-pll` 参数时），`UniXNU-evb10` 的 `board.toml` 默认是 750 MHz（UEFI 的 0.75 V）；1 GHz 要 0.85 V 的固件（`GPU_RAIL_UV`）；SCMI 调频没做。
 5. 对 G610 的缓存一致性：先按「非一致」处理（CPU 侧共享缓冲用 Write-Combine）。
 
 ## 工具
