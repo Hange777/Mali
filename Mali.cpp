@@ -131,6 +131,37 @@ uint64_t pllKHz(unsigned con) {
 
 bool pllLocked(unsigned con) { return (gCru[con + 6] & (1u << 15)) != 0; }
 
+// mali-npll=MHz (with mali-pll=3): move NPLL to another rate before the GPU is switched onto it. Only the multiplier m (CON0 [9:0]) is changed, p and s stay
+// as the firmware left them (850 MHz = 24 * 425 / 3 / 4), so the VCO (24 MHz * m / p) has to stay in the PLL's 2.25 .. 4.5 GHz range: 1000 MHz is m = 500, VCO 4 GHz.
+// The GPU is not on NPLL yet (it is on a different source while the driver starts), and nothing else in this system runs from it; if the PLL does not lock
+// again the old multiplier is restored.
+void setNpllMHz(unsigned mhz) {
+  const unsigned con = kPlls[3].con;
+  const uint32_t c0 = gCru[con], c1 = gCru[con + 1];
+  const uint64_t p = c1 & 0x3f, s = (c1 >> 6) & 7;
+  if (!p || (c1 & (1u << 13))) { printf("mali: mali-npll: npll is powered down or has no divider, left alone\n"); return; }
+  const uint64_t m = ((static_cast<uint64_t>(mhz) * p << s) + 12) / 24;   // 24 MHz * m / p / 2^s = mhz
+  const uint64_t vcoMHz = 24 * m / p;
+  if (m < 1 || m > 1023 || vcoMHz < 2250 || vcoMHz > 4500) {
+    printf("mali: mali-npll=%u: m %llu or VCO %llu MHz outside the PLL's range, left alone\n", mhz, static_cast<unsigned long long>(m), static_cast<unsigned long long>(vcoMHz));
+    return;
+  }
+  gCru[con] = (0x3ffu << 16) | static_cast<uint32_t>(m);
+  __asm__ volatile("dsb sy" ::: "memory");
+  IODelay(20);   // the lock bit does not drop at once
+  bool locked = waitUs(5000, [] { return pllLocked(kPlls[3].con); });
+  if (locked) IODelay(200);
+  printf("mali: mali-npll=%u: m %u -> %llu, npll now %llu kHz (locked %u, con %#x %#x)\n", mhz, c0 & 0x3ff, static_cast<unsigned long long>(m),
+         static_cast<unsigned long long>(pllKHz(con)), locked ? 1 : 0, gCru[con], gCru[con + 1]);
+  if (!locked) {
+    gCru[con] = (0x3ffu << 16) | (c0 & 0x3ff);
+    __asm__ volatile("dsb sy" ::: "memory");
+    IODelay(20);
+    locked = waitUs(5000, [] { return pllLocked(kPlls[3].con); });
+    printf("mali: mali-npll: no lock, back to m %u: npll %llu kHz (locked %u)\n", c0 & 0x3ff, static_cast<unsigned long long>(pllKHz(con)), locked ? 1 : 0);
+  }
+}
+
 void setClocks() {
   unsigned div = 5;
   PE_parse_boot_argn("mali-div", &div, sizeof div);
@@ -147,6 +178,8 @@ void setClocks() {
     printf("mali: %s is not running or not locked: staying on gpll\n", kPlls[source].name);
     source = 0;
   }
+  unsigned npllMhz = 0;
+  if (source == 3 && PE_parse_boot_argn("mali-npll", &npllMhz, sizeof npllMhz) && npllMhz >= 400 && npllMhz <= 1100) setNpllMHz(npllMhz);
   printf("mali: clocks before: sel158 %#x gate66 %#x\n", gCru[kCruSel158 / 4], gCru[kCruGate66 / 4]);
   gCru[kCruSel158 / 4] = (0xffu << 16) | (source << 5) | div;                      // PLL / (div + 1)
   gCru[kCruGate66 / 4] = ((1u << 1 | 1u << 4 | 1u << 6 | 1u << 7) << 16);          // ungate the four GPU clocks
