@@ -48,6 +48,9 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 // Weak fallbacks keep a kernel that links this driver without the display archive linkable; the display driver's strong definitions replace them.
 extern "C" __attribute__((weak)) IOReturn native_gop_handoff_call(uint32_t, task_t, const void *, size_t, void *, size_t) { return kIOReturnUnsupported; }
 extern "C" __attribute__((weak)) IOMemoryDescriptor *native_gop_handoff_memory(void) { return nullptr; }
+// patches/xnu/evb10-thread-sample.patch (osfmk/kern/bsd_kern.c): whether a task's address range belongs to a file (a vnode pager). The weak fallback is for
+// a kernel without that patch: nothing is then copied.
+extern "C" __attribute__((weak)) boolean_t evb10_range_is_file_backed(task_t, uint64_t, uint64_t) { return 0; }
 
 namespace {
 
@@ -906,6 +909,7 @@ struct Bo {
   unsigned *poolIdx;     // the granules it holds (any of the pool's, not necessarily next to each other)
   unsigned poolCount;
   bool readOnly;         // BO_CREATE_HOST over pages the task maps read-only (a mapped file, a constant segment): the GPU maps them read-only too
+  bool hostCopy;         // BO_CREATE_HOST over a file's pages: a copy in pages of its own (md, kva), not a pin of the caller's (see boCreateHost)
 };
 unsigned gBoLive;
 uint64_t gBoContig[2];    // buffer objects of 2 MiB or more: [0] made of one 2 MiB aligned run of physical memory, [1] of whatever pages the allocator had
@@ -1061,6 +1065,25 @@ Bo *boCreateHost(task_t task, uint64_t ptr, uint64_t size, void *owner) {
     return nullptr;
   };
   if (!task || !size || (ptr | size) & 0xfff || size > (1ull << 30) || ptr + size < ptr) return refuse("bad range");
+  // Pages of a file (an application's mapped assets, which the render server shares with the application) are copied, not pinned: a pin holds the
+  // object's activity count, and the unmap of the file's last mapping waits for it (vm_object_destroy) in the thread that is to retire the GPU work
+  // that holds the pin: the render server stopped for good at the first application launch (xnu-probe/runs/t17). What the GPU reads of them is what
+  // the file held when the buffer was made; the memory of such a mapping does not change under a reader (the application's own, writable, memory
+  // and every IOSurface are not a vnode pager's and are pinned as before).
+  if (evb10_range_is_file_backed(task, ptr, size)) {
+    Bo *copy = boCreate(static_cast<size_t>(size), owner);
+    if (!copy) return refuse("no memory for the copy of a file's pages");
+    IOMemoryDescriptor *source = IOMemoryDescriptor::withAddressRange(ptr, size, static_cast<IOOptionBits>(kIODirectionOut), task);
+    IOByteCount got = 0;
+    if (source && source->prepare() == kIOReturnSuccess) { got = source->readBytes(0, copy->kva, static_cast<IOByteCount>(size)); (void)source->complete(); }
+    if (source) source->release();
+    if (got != size) { boFree(copy); return refuse("a file's pages not read", got, size); }
+    __asm__ volatile("dsb sy" ::: "memory");
+    copy->hostCopy = true;
+    static unsigned copied;
+    if (copied++ < 16) printf("mali: host bo of %#llx bytes at %#llx is a file's: copied, not pinned (%u so far, live bos %d)\n", size, ptr, copied, (int)gBoLive);
+    return copy;
+  }
   Bo *bo = IONewZero(Bo, 1);
   if (!bo) return refuse("no memory");
   ++gBoLive;
@@ -2334,7 +2357,7 @@ IOReturn MaliClient::dispatch(uint32_t selector, const uint8_t *in, uint32_t inS
       NEED_IN(mali_bo_destroy_in, i);
       Bo *bo = boFor(i.handle);
       if (!bo) return kIOReturnBadArgument;
-      if (!bo->host) boLiveBytes -= bo->size;
+      if (!bo->host && !bo->hostCopy) boLiveBytes -= bo->size;
       bos[i.handle - 1] = nullptr;
       boRelease(bo);
       return kIOReturnSuccess;
@@ -2635,7 +2658,7 @@ MaliAccelerator::~MaliAccelerator() { static_cast<const AccelMeta *>(gAccelMeta)
 IOService *gAccelerator;
 
 void publishAccelerator() {
-  char plugin[32] = "NativeMaliMetal", klass[32] = "NativeMaliMetalDevice", grant[256] = "backboardd,SpringBoard,PosterBoard,WidgetRenderer_D,AegirPoster,KaleidoscopePost,CollectionsPoste,PhotosPosterProv,MercuryPosterExt,GradientPosterEx,EmojiPosterExten,ExtragalacticPos,HelloPosterExten,PridePosterExten,UnityPosterExten";   // names are compared up to 16 characters: the wallpaper extensions render too (which of them is on the lock screen depends on the Data volume, so all of them are named)
+  char plugin[32] = "NativeMaliMetal", klass[32] = "NativeMaliMetalDevice", grant[512] = "backboardd,iconservicesagen,Preferences,SpringBoard,PosterBoard,WidgetRenderer_D,AegirPoster,KaleidoscopePost,CollectionsPoste,PhotosPosterProv,MercuryPosterExt,GradientPosterEx,EmojiPosterExten,ExtragalacticPos,HelloPosterExten,PridePosterExten,UnityPosterExten";   // names are compared up to 16 characters: the wallpaper extensions render too (which of them is on the lock screen depends on the Data volume, so all of them are named)
   PE_parse_boot_argn("mali-plugin", plugin, sizeof plugin);
   PE_parse_boot_argn("mali-plugin-grant", grant, sizeof grant);
   const OSReturn loaded = OSKextLoadKextWithIdentifier("com.apple.iokit.IOGPUFamily");
@@ -2665,7 +2688,7 @@ void publishAccelerator() {
 }
 
 void serviceRegister() {
-  char grant[256] = "gpu-test,backboardd,SpringBoard,PosterBoard,WidgetRenderer_D,AegirPoster,KaleidoscopePost,CollectionsPoste,PhotosPosterProv,MercuryPosterExt,GradientPosterEx,EmojiPosterExten,ExtragalacticPos,HelloPosterExten,PridePosterExten,UnityPosterExten";
+  char grant[512] = "gpu-test,backboardd,iconservicesagen,Preferences,SpringBoard,PosterBoard,WidgetRenderer_D,AegirPoster,KaleidoscopePost,CollectionsPoste,PhotosPosterProv,MercuryPosterExt,GradientPosterEx,EmojiPosterExten,ExtragalacticPos,HelloPosterExten,PridePosterExten,UnityPosterExten";
   PE_parse_boot_argn("mali-grant", grant, sizeof grant);
   gService->setProperty("NativeSandboxGrantProcess", grant);
   gService->registerService();
