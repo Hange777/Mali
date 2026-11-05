@@ -621,7 +621,7 @@ struct RingOutput { uint64_t extract; uint32_t active; };  // page 1
 
 enum : uint32_t {
   kCsStateMask = 7, kCsStateStart = 1, kCsExtractEvent = 1u << 4, kCsIdleSyncWait = 1u << 8, kCsIdleEmpty = 1u << 10,
-  kCsgStateMask = 7, kCsgStateStart = 1, kCsgEndpointConfig = 1u << 4,
+  kCsgStateMask = 7, kCsgStateStart = 1, kCsgStateSuspend = 2, kCsgStateResume = 3, kCsgEndpointConfig = 1u << 4,
 };
 
 constexpr uint64_t kRingVa = 0x20000000ULL, kDataVa = 0x20010000ULL, kCodeVa = 0x20020000ULL, kDescVa = 0x20030000ULL, kData2Va = 0x20040000ULL;   // in the GPU's address space (AS1)
@@ -1397,15 +1397,21 @@ int heapCreate(Ctx &c, uint32_t initialChunks, uint32_t chunkSize, uint32_t maxC
   return static_cast<int>(slot);
 }
 
-// What lives in the MCU's address space for a CSG slot: the queues' input / output pages and the suspend buffers. Allocated on first use, kept.
-struct SlotRes {
-  bool ready;
+// What a group keeps in the MCU's address space whether or not it sits in a slot (Panthor's queue->iface and group->suspend_buf): the queues' input / output
+// pages and the suspend buffers. A group that leaves its slot is SUSPENDED, not terminated: the firmware saves the queues' registers into the suspend buffer
+// and the group takes up where it was when it is given a slot again. The user's command streams count on that: Mesa's PanVK sets registers (the
+// subqueue context, scoreboards, the tiler pointers) once, in the first job of a queue, and the later jobs only use them. A group that is started afresh
+// has all of them zero, and its first job that loads through one reads address 0: the translation fault (status 0x7cc002c1, address 0) that
+// then stopped the whole GPU. These buffers belong to the group, so they stay where the firmware saved into them (and keep their addresses).
+// The pool is kept and the buffers reused: the MCU's address range is only ever handed out, never taken back.
+struct HwRes {
+  bool used, ready;
   Mem iface[kMaxQueues];
   uint32_t ifaceVa[kMaxQueues];
   Mem suspend, protm;
   uint32_t suspendVa, protmVa;
 };
-SlotRes gSlotRes[kMaxGroups];
+HwRes gHwRes[kMaxGroupObjs];
 uint32_t gMcuNext = 0x04300000;
 
 bool mcuAlloc(Mem &m, size_t size, uint32_t &va) {
@@ -1417,11 +1423,34 @@ bool mcuAlloc(Mem &m, size_t size, uint32_t &va) {
   return true;
 }
 
+HwRes *hwAcquire(size_t suspendSize, size_t protmSize) {
+  HwRes *h = nullptr;
+  for (HwRes &x : gHwRes)
+    if (!x.used) { h = &x; break; }
+  if (!h) return nullptr;
+  if (!h->ready) {
+    bool ok = true;
+    for (unsigned q = 0; ok && q < kMaxQueues; ++q) ok = mcuAlloc(h->iface[q], 0x2000, h->ifaceVa[q]);
+    ok = ok && mcuAlloc(h->suspend, suspendSize, h->suspendVa);
+    if (ok && protmSize) ok = mcuAlloc(h->protm, protmSize, h->protmVa);
+    if (!ok || !asFlushAll(0)) return nullptr;
+    h->ready = true;
+  }
+  memset(h->suspend.kva, 0, h->suspend.size);
+  if (h->protm.md) memset(h->protm.kva, 0, h->protm.size);
+  for (unsigned q = 0; q < kMaxQueues; ++q) memset(h->iface[q].kva, 0, h->iface[q].size);
+  __asm__ volatile("dsb sy" ::: "memory");
+  h->used = true;
+  return h;
+}
+
+struct JobRec { uint64_t seq, va; uint32_t size, flush; };
 struct Queue {
   Mem ring;
   uint64_t ringVa;
   uint32_t ringSize;
   uint64_t insert, seqno;   // byte offset ever written / jobs ever submitted
+  JobRec rec[8];            // the last eight jobs (slot seq % 8): what a fault or a stall report says the stuck job was
 };
 struct GroupParams {
   unsigned queues;
@@ -1436,6 +1465,8 @@ struct Group {
   Ctx *ctx;
   void *owner;
   unsigned csg, queues;   // csg: the CSG slot it sits in now, kNoSlot when in none (the rings and syncobjs are all it has then)
+  HwRes *hw;              // its queue interface pages and suspend buffers (from its first start until it is released)
+  bool suspended;         // it left its slot by SUSPEND: the firmware saved its queues' state into hw->suspend, the next start is a RESUME
   uint64_t lastUse;
   GroupParams gp;
   Queue q[kMaxQueues];
@@ -1482,6 +1513,7 @@ void ringGlobalDoorbell(unsigned csg) {
 void groupRelease(Group &g) {
   for (unsigned q = 0; q < kMaxQueues; ++q) memFree(g.q[q].ring);
   memFree(g.sync);
+  if (g.hw) { g.hw->used = false; g.hw = nullptr; }
   g.used = false;
   g.ctx = nullptr;
 }
@@ -1503,27 +1535,39 @@ bool groupIdle(Group &g) {
   if (g.csg == kNoSlot) return true;
   for (unsigned q = 0; q < g.queues; ++q) {
     const volatile uint64_t *done = reinterpret_cast<volatile uint64_t *>(g.sync.kva + q * 16);
-    const volatile RingOutput *ro = reinterpret_cast<volatile RingOutput *>(gSlotRes[g.csg].iface[q].kva + 0x1000);
+    const volatile RingOutput *ro = reinterpret_cast<volatile RingOutput *>(g.hw->iface[q].kva + 0x1000);
     if (*done < g.q[q].seqno || ro->extract != g.q[q].insert) return false;
   }
   return true;
 }
 
-// Take the group out of its slot (what it has run is done, or it is being destroyed).
-void groupStop(Group &g) {
+// Take the group out of its slot. suspend: it will be back (what it has run is done, but the registers of its queues are its state): the firmware saves
+// them. Without suspend, or when the firmware does not answer the suspend, the CSG is terminated and whatever the queues held is gone.
+void groupStop(Group &g, bool suspend = false) {
   if (g.csg == kNoSlot) return;
+  bool kept = false;
   SlotView s;
   if (slotView(g.csg, s)) {
-    s.in->req = s.in->req & ~kCsgStateMask;   // CSG_STATE_TERMINATE = 0
-    ringGlobalDoorbell(g.csg);
-    const bool gone = waitUs(1000000, [&s] { return (s.out->ack & kCsgStateMask) == 0; });
-    if (!gone) { printf("mali: group %u did NOT terminate (req %#x ack %#x)\n", g.csg, s.in->req, s.out->ack); faultReport(); }
+    if (suspend) {
+      s.in->req = (s.in->req & ~kCsgStateMask) | kCsgStateSuspend;
+      ringGlobalDoorbell(g.csg);
+      const bool answered = waitUs(1000000, [&s] { const uint32_t st = s.out->ack & kCsgStateMask; return st == kCsgStateSuspend || st == 0; });
+      kept = answered && (s.out->ack & kCsgStateMask) == kCsgStateSuspend;
+      if (!kept) { printf("mali: group %u did NOT suspend (req %#x ack %#x)\n", g.id, s.in->req, s.out->ack); faultReport(); }
+    }
+    if (!kept) {
+      s.in->req = s.in->req & ~kCsgStateMask;   // CSG_STATE_TERMINATE = 0
+      ringGlobalDoorbell(g.csg);
+      const bool gone = waitUs(1000000, [&s] { return (s.out->ack & kCsgStateMask) == 0; });
+      if (!gone) { printf("mali: group %u did NOT terminate (req %#x ack %#x)\n", g.csg, s.in->req, s.out->ack); faultReport(); }
+    }
     for (unsigned q = 0; q < g.queues; ++q) {
       CsView c;
       if (csView(s, q, c)) c.in->req = c.in->req & ~kCsStateMask;   // CS_STATE_STOP
     }
     __asm__ volatile("dsb sy" ::: "memory");
   }
+  g.suspended = kept;
   gSlotGroup[g.csg] = nullptr;
   if (g.ctx && g.ctx->residentGroups) --g.ctx->residentGroups;
   g.csg = kNoSlot;
@@ -1538,19 +1582,18 @@ bool groupStart(Group &g, unsigned csg) {
   if (!slotView(csg, s)) { printf("mali: group: slot %u interface outside the shared section\n", csg); return false; }
   if (queues > s.ctl->streamNum) { printf("mali: group: %u queues wanted, the slot has %u\n", queues, s.ctl->streamNum); return false; }
 
-  SlotRes &sr = gSlotRes[csg];
-  if (!sr.ready) {
-    const size_t suspendSize = s.ctl->suspendSize ? s.ctl->suspendSize : 0x1000, protmSize = s.ctl->protmSuspendSize;
-    bool ok = true;
-    for (unsigned q = 0; ok && q < kMaxQueues; ++q) ok = mcuAlloc(sr.iface[q], 0x2000, sr.ifaceVa[q]);
-    ok = ok && mcuAlloc(sr.suspend, suspendSize, sr.suspendVa);
-    if (ok && protmSize) ok = mcuAlloc(sr.protm, protmSize, sr.protmVa);
-    if (!ok || !asFlushAll(0)) { printf("mali: group: no memory for the slot %u interface pages\n", csg); return false; }
-    sr.ready = true;
+  if (!g.hw) {
+    g.hw = hwAcquire(s.ctl->suspendSize ? s.ctl->suspendSize : 0x1000, s.ctl->protmSuspendSize);
+    if (!g.hw) { printf("mali: group: no memory for the interface pages of group %u\n", g.id); return false; }
+    g.suspended = false;
   }
-  memset(sr.suspend.kva, 0, sr.suspend.size);
-  if (sr.protm.md) memset(sr.protm.kva, 0, sr.protm.size);
-  for (unsigned q = 0; q < kMaxQueues; ++q) memset(sr.iface[q].kva, 0, sr.iface[q].size);
+  HwRes &sr = *g.hw;
+  const bool resume = g.suspended;   // the firmware has this group's state: the pages are left as they are
+  if (!resume) {
+    memset(sr.suspend.kva, 0, sr.suspend.size);
+    if (sr.protm.md) memset(sr.protm.kva, 0, sr.protm.size);
+    for (unsigned q = 0; q < kMaxQueues; ++q) memset(sr.iface[q].kva, 0, sr.iface[q].size);
+  }
   __asm__ volatile("dsb sy" ::: "memory");
 
   // cs_slot_prog_locked() for every queue, then csg_slot_prog_locked()
@@ -1561,7 +1604,7 @@ bool groupStart(Group &g, unsigned csg) {
     if (!csView(s, q, c)) { printf("mali: group: stream %u interface outside the shared section\n", q); return false; }
     volatile RingInput *ri = reinterpret_cast<volatile RingInput *>(sr.iface[q].kva);
     volatile RingOutput *ro = reinterpret_cast<volatile RingOutput *>(sr.iface[q].kva + 0x1000);
-    ro->extract = g.q[q].insert;
+    if (!resume) ro->extract = g.q[q].insert;   // a resumed queue's extract is the firmware's own
     ri->insert = g.q[q].insert;
     ri->extract = ro->extract;
     c.in->ringbufBase = g.q[q].ringVa;
@@ -1583,11 +1626,12 @@ bool groupStart(Group &g, unsigned csg) {
   s.in->ackIrqMask = ~0u;
   s.in->doorbellReq = (s.in->doorbellReq & ~mask) | ((~s.out->doorbellAck) & mask);
   __asm__ volatile("dsb sy" ::: "memory");
-  s.in->req = (s.in->req & ~(kCsgStateMask | kCsgEndpointConfig)) | kCsgStateStart | ((s.out->ack ^ kCsgEndpointConfig) & kCsgEndpointConfig);
+  const uint32_t want = resume ? kCsgStateResume : kCsgStateStart;
+  s.in->req = (s.in->req & ~(kCsgStateMask | kCsgEndpointConfig)) | want | ((s.out->ack ^ kCsgEndpointConfig) & kCsgEndpointConfig);
   ringGlobalDoorbell(csg);
-  const bool started = waitUs(1000000, [&s] { return (s.out->ack & (kCsgStateMask | kCsgEndpointConfig)) == (kCsgStateStart | (s.in->req & kCsgEndpointConfig)); });
+  const bool started = waitUs(1000000, [&s, want] { return (s.out->ack & (kCsgStateMask | kCsgEndpointConfig)) == (want | (s.in->req & kCsgEndpointConfig)); });
   if (!started) {
-    printf("mali: group: slot %u did NOT start (req %#x ack %#x)\n", csg, s.in->req, s.out->ack);
+    printf("mali: group: slot %u did NOT %s (req %#x ack %#x)\n", csg, resume ? "resume" : "start", s.in->req, s.out->ack);
     faultReport();
     return false;
   }
@@ -1601,6 +1645,7 @@ bool groupStart(Group &g, unsigned csg) {
   }
   gSlotGroup[csg] = &g;
   g.csg = csg;
+  g.suspended = false;
   ++ctx.residentGroups;
   g.lastUse = ++gUseClock;
   static unsigned shown;
@@ -1620,7 +1665,7 @@ bool groupEvictIdle(const Group *except) {
     if (!victim || x->lastUse < victim->lastUse) victim = x;
   }
   if (!victim) return false;
-  groupStop(*victim);
+  groupStop(*victim, true);
   return true;
 }
 
@@ -1690,8 +1735,8 @@ bool groupSubmit(Group &g, unsigned q, uint64_t csVa, uint32_t csSize, uint32_t 
   SlotView s;
   CsView c;
   if (g.csg == kNoSlot || !slotView(g.csg, s) || !csView(s, q, c)) return false;
-  volatile RingInput *ri = reinterpret_cast<volatile RingInput *>(gSlotRes[g.csg].iface[q].kva);
-  volatile RingOutput *ro = reinterpret_cast<volatile RingOutput *>(gSlotRes[g.csg].iface[q].kva + 0x1000);
+  volatile RingInput *ri = reinterpret_cast<volatile RingInput *>(g.hw->iface[q].kva);
+  volatile RingOutput *ro = reinterpret_cast<volatile RingOutput *>(g.hw->iface[q].kva + 0x1000);
   if (qu.insert + kJobBytes - ro->extract > qu.ringSize) return false;
 
   const unsigned regs = (c.ctl->features & 0xff) + 1;
@@ -1730,6 +1775,7 @@ bool groupSubmit(Group &g, unsigned q, uint64_t csVa, uint32_t csSize, uint32_t 
   __asm__ volatile("dsb sy" ::: "memory");
   qu.insert += kJobBytes;
   *seqno = ++qu.seqno;
+  qu.rec[qu.seqno & 7] = JobRec{qu.seqno, csVa, csSize, latestFlush};
   ri->extract = ro->extract;
   ri->insert = qu.insert;
   __asm__ volatile("dsb sy" ::: "memory");
@@ -1740,6 +1786,62 @@ bool groupSubmit(Group &g, unsigned q, uint64_t csVa, uint32_t csSize, uint32_t 
 bool groupWait(Group &g, unsigned q, uint64_t seqno, unsigned timeoutUs) {
   volatile uint64_t *done = reinterpret_cast<volatile uint64_t *>(g.sync.kva + q * 16);
   return waitUs(timeoutUs, [done, seqno] { return *done >= seqno; });
+}
+
+// Read a word of what a client mapped, through the kernel's mapping of the buffer (not for host buffers: they have none).
+bool ctxRead64(const Ctx *c, uint64_t va, uint64_t *v) {
+  if (!c) return false;
+  for (unsigned i = 0; i < c->mapCount; ++i) {
+    const MapRec &m = c->maps[i];
+    if (va < m.va || va + 8 > m.va + m.size || !m.bo || !m.bo->kva) continue;
+    *v = *reinterpret_cast<volatile uint64_t *>(m.bo->kva + m.boOffset + (va - m.va));
+    return true;
+  }
+  return false;
+}
+
+// Panthor's CSG_STATUS_UPDATE: toggle the request bit, ring the slot's doorbell, wait for the firmware to answer. After it the queues' status words (the
+// command pointer, why the queue is blocked, what it waits for) are current. False: the firmware did not answer in 50 ms.
+bool csgStatusUpdate(unsigned csg) {
+  SlotView s;
+  if (!slotView(csg, s)) return false;
+  const uint32_t bit = 1u << 5;
+  s.in->req = (s.in->req & ~bit) | (~s.out->ack & bit);
+  __asm__ volatile("dsb sy" ::: "memory");
+  ringGlobalDoorbell(csg);
+  return waitUs(50000, [&s] { return ((s.in->req ^ s.out->ack) & (1u << 5)) == 0; });
+}
+
+// The job a queue is on (the first one its syncobj has not reached): the kernel's own instructions for it from the ring (the MOV48 before the CALL
+// holds the start of the user's stream), the record of the submit, and the first words of the user's stream if the kernel can read them.
+void jobDump(Group &g, unsigned q, const char *why) {
+  static unsigned shown;
+  if (shown >= 12 || q >= g.queues) return;
+  Queue &qu = g.q[q];
+  const uint64_t done = *reinterpret_cast<volatile uint64_t *>(g.sync.kva + q * 16);
+  const uint64_t seq = done + 1;
+  if (seq > qu.seqno) return;
+  ++shown;
+  const JobRec &r = qu.rec[seq & 7];
+  printf("mali: JOB [%s] group %u queue %u job %llu of %llu: record seq %llu cs va %#llx size %u flush %u\n", why, g.id, q, static_cast<unsigned long long>(seq),
+         static_cast<unsigned long long>(qu.seqno), static_cast<unsigned long long>(r.seq), static_cast<unsigned long long>(r.va), r.size, r.flush);
+  const uint64_t at = ((seq - 1) * kJobBytes) & (qu.ringSize - 1);
+  const volatile uint64_t *w = reinterpret_cast<volatile uint64_t *>(qu.ring.kva + at);
+  for (unsigned i = 0; i < 16; i += 4)
+    printf("mali: JOB   ring %#llx: %016llx %016llx %016llx %016llx\n", static_cast<unsigned long long>(at + i * 8), static_cast<unsigned long long>(w[i]),
+           static_cast<unsigned long long>(w[i + 1]), static_cast<unsigned long long>(w[i + 2]), static_cast<unsigned long long>(w[i + 3]));
+  // the stream's address and size as the ring has them (instruction 2 is MOV48 addr, 3 is MOV32 size): the record of the job may be overwritten by now
+  const uint64_t va = w[2] & 0xffffffffffffull;
+  const uint32_t size = static_cast<uint32_t>(w[3] & 0xffffffffu);
+  uint64_t v[4];
+  for (unsigned i = 0; i < size / 8 && i < 160; i += 4) {
+    unsigned n = 0;
+    for (; n < 4 && i + n < size / 8 && ctxRead64(g.ctx, va + (i + n) * 8, &v[n]); ++n) {}
+    if (!n) { printf("mali: JOB   user stream at %#llx: not readable by the kernel\n", static_cast<unsigned long long>(va + i * 8)); break; }
+    printf("mali: JOB   user %#llx:", static_cast<unsigned long long>(va + i * 8));
+    for (unsigned k = 0; k < n; ++k) printf(" %016llx", static_cast<unsigned long long>(v[k]));
+    printf("\n");
+  }
 }
 
 // Say what went wrong on the GPU as it happens: an MMU fault (which address space, which address) and a queue that faulted or died (what the firmware says).
@@ -1758,6 +1860,11 @@ void gpuFaultScan(const char *when) {
       printf("mali: MMU %s in AS%u (%s): status %#x address %#llx, AS status %#x [%s]\n", (raw & (1u << (16 + as))) ? "bus fault" : "page fault", as,
              gAsCtx[as] ? "a client's" : "none", status, static_cast<unsigned long long>(address), gpu(asReg(as, kAsStatus)), when);
       ++shown;
+      for (unsigned gi = 0; gi < kMaxGroupObjs; ++gi) {
+        Group &gg = gGroup[gi];
+        if (gg.used && gg.ctx && gg.ctx == gAsCtx[as] && gg.csg != kNoSlot)
+          for (unsigned q = 0; q < gg.queues; ++q) jobDump(gg, q, "mmu fault");
+      }
     }
     gpuWrite(kMmuIntClear, raw);
   }
@@ -2146,7 +2253,7 @@ inline uint64_t cntvct() {
 // A group in a slot with jobs that do not finish: the user side polls the syncobj without telling us, so the driver looks for itself, at most once a
 // second, on any call. Says where the group stands (slot, address space, per queue: jobs done / given, ring extract / insert, what the firmware reports).
 void gpuStallScan() {
-  static uint64_t last, since[kMaxGroupObjs], reported[kMaxGroupObjs];
+  static uint64_t last, since[kMaxGroupObjs], reported[kMaxGroupObjs], lastSum[kMaxGroupObjs];
   static unsigned shown;
   if (shown >= 60) return;
   if (!gCallStatFreq) __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(gCallStatFreq));
@@ -2158,12 +2265,15 @@ void gpuStallScan() {
     if (!g || g->id == 0 || g->id > kMaxGroupObjs) continue;
     const unsigned idx = g->id - 1;
     bool pending = false;
+    uint64_t sum = 0;
     for (unsigned q = 0; q < g->queues; ++q) {
       const volatile uint64_t *done = reinterpret_cast<volatile uint64_t *>(g->sync.kva + q * 16);
       if (*done < g->q[q].seqno) pending = true;
+      sum += *done;
     }
-    if (!pending) { since[idx] = 0; reported[idx] = 0; continue; }
-    if (!since[idx]) { since[idx] = now; continue; }
+    if (!pending) { since[idx] = 0; reported[idx] = 0; lastSum[idx] = sum; continue; }
+    // only a group that finished nothing since the last look is stuck: a busy one is always "pending" at a glance
+    if (!since[idx] || sum != lastSum[idx]) { since[idx] = now; reported[idx] = 0; lastSum[idx] = sum; continue; }
     if (now - since[idx] < 2 * gCallStatFreq || (reported[idx] && now - reported[idx] < 4 * gCallStatFreq)) continue;
     reported[idx] = now;
     SlotView s;
@@ -2171,15 +2281,19 @@ void gpuStallScan() {
     printf("mali: STALL group %u in slot %u (AS%u) for %llu s: csg req %#x ack %#x state %#x endpoint %#x/%#x\n", g->id, slot, g->ctx ? g->ctx->as : 0u,
            static_cast<unsigned long long>((now - since[idx]) / gCallStatFreq), s.in->req, s.out->ack, s.out->statusState, s.out->statusEndpointCurrent, s.out->statusEndpointReq);
     ++shown;
+    if (shown <= 24) printf("mali: STALL   status update %s\n", csgStatusUpdate(slot) ? "answered" : "NOT answered in 50 ms");
     for (unsigned q = 0; q < g->queues; ++q) {
       CsView c;
       if (!csView(s, q, c)) continue;
-      const volatile RingInput *ri = reinterpret_cast<volatile RingInput *>(gSlotRes[slot].iface[q].kva);
-      const volatile RingOutput *ro = reinterpret_cast<volatile RingOutput *>(gSlotRes[slot].iface[q].kva + 0x1000);
+      const volatile RingInput *ri = reinterpret_cast<volatile RingInput *>(g->hw->iface[q].kva);
+      const volatile RingOutput *ro = reinterpret_cast<volatile RingOutput *>(g->hw->iface[q].kva + 0x1000);
       printf("mali: STALL   queue %u: jobs %llu of %llu, ring extract %#llx insert %#llx active %u, cs req %#x ack %#x, cmd %#llx blocked %u wait %#x, fault %#x fatal %#x\n", q,
              static_cast<unsigned long long>(*reinterpret_cast<volatile uint64_t *>(g->sync.kva + q * 16)), static_cast<unsigned long long>(g->q[q].seqno),
              static_cast<unsigned long long>(ro->extract), static_cast<unsigned long long>(ri->insert), ro->active, c.in->req, c.out->ack,
              static_cast<unsigned long long>(c.out->statusCmdPtr), c.out->statusBlockedReason, c.out->statusWait, c.out->fault, c.out->fatal);
+      if (shown <= 24) printf("mali: STALL   queue %u: sync wait ptr %#llx value %#x%08x, scoreboards %#x, req resource %#x\n", q, static_cast<unsigned long long>(c.out->statusWaitSyncPtr),
+                              c.out->statusWaitSyncValueHi, c.out->statusWaitSyncValue, c.out->statusScoreboards, c.out->statusReqResource);
+      jobDump(*g, q, "stall");
     }
     printf("mali: STALL   mmu AS%u: fault status %#x, status %#x; job irq raw %#x, mcu %u\n", g->ctx ? g->ctx->as : 0u, g->ctx ? gpu(asReg(g->ctx->as, kAsFaultStatus)) : 0u,
            g->ctx ? gpu(asReg(g->ctx->as, kAsStatus)) : 0u, gpu(kJobIntRaw), gpu(kMcuStatus));
