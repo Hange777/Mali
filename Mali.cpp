@@ -2034,14 +2034,30 @@ void m1() {
 class MaliClient : public IOUserClient {
   OSDeclareDefaultStructors(MaliClient)
 
-  static constexpr unsigned kMaxBoHandles = 4096;
+  // The handle table starts small and doubles when every handle is taken, up to kMaxBoHandles. It was a fixed 4096: the render server of an
+  // Orange Pi 5 that opened the App Library (a blur per folder, a few hundred command buffers a second for half a minute) used all of them,
+  // after which every BO_CREATE failed and PanVK reported OUT_OF_DEVICE_MEMORY from its command stream, descriptor and TLS pools: the frame was
+  // left half drawn (black, white and magenta blocks, flicker as freed handles let some frames through).
+  static constexpr unsigned kBoHandlesStart = 4096, kMaxBoHandles = 16384;
   task_t ownerTask = nullptr;   // the process that opened this connection (BO_CREATE_HOST wires its pages)
   Bo **bos = nullptr;      // handle - 1
+  unsigned boCap = 0;      // entries of bos
+  unsigned boScan = 0;     // every handle below this index is in use (a free one is looked for from here)
+  unsigned boLive = 0;     // handles in use
+  unsigned boClass[6] = {};   // handles in use by size: <= 4 KiB, <= 16 KiB, <= 64 KiB, <= 256 KiB, <= 2 MiB, more
+  unsigned boNextReport = 1024;
+  uint64_t boSubmits = 0;
+  char boTrace[176] = {};  // mali-bo-trace: what the buffer objects did since the last group submit (+KiB made, -KiB freed)
+  unsigned boTraceLen = 0;
   bool closed = false;
   char ownerName[17] = {};         // what the process is called, for the line the connection leaves when it closes
   uint64_t boLiveBytes = 0, boPeakBytes = 0, boHostBytes = 0, boCreated = 0;   // what it asked for: a process under a memory limit is killed for its footprint
 
-  Bo *boFor(uint32_t handle) { return (bos && handle && handle <= kMaxBoHandles) ? bos[handle - 1] : nullptr; }
+  Bo *boFor(uint32_t handle) { return (bos && handle && handle <= boCap) ? bos[handle - 1] : nullptr; }
+  unsigned boSlot();                       // a free index of bos, the table grown if need be; kMaxBoHandles if there is none
+  void boAdded(const Bo *bo);              // accounting of a handle just filled
+  void boRemoved(const Bo *bo);            // accounting of a handle just emptied (before the BO is released)
+  void boTraceFlush();
   Ctx *vmFor(uint32_t id) { return (id && id <= kMaxCtx && gCtx[id - 1].used && gCtx[id - 1].owner == this) ? &gCtx[id - 1] : nullptr; }
   Group *groupFor(uint32_t id) { return (id && id <= kMaxGroupObjs && gGroup[id - 1].used && gGroup[id - 1].owner == this) ? &gGroup[id - 1] : nullptr; }
   void releaseAll();
@@ -2135,8 +2151,68 @@ bool MaliClient::initWithTask(task_t owningTask, void *securityToken, UInt32 typ
   if (!IOUserClient::initWithTask(owningTask, securityToken, type)) return false;
   ownerTask = owningTask;
   proc_selfname(ownerName, sizeof ownerName);
-  bos = IONewZero(Bo *, kMaxBoHandles);
+  bos = IONewZero(Bo *, kBoHandlesStart);
+  boCap = bos ? kBoHandlesStart : 0;
   return bos != nullptr;
+}
+
+unsigned MaliClient::boSlot() {
+  for (;;) {
+    for (unsigned h = boScan; h < boCap; ++h)
+      if (!bos[h]) { boScan = h; return h; }   // not h + 1: the caller may fail to fill it
+    boScan = boCap;
+    if (boCap >= kMaxBoHandles) return kMaxBoHandles;
+    const unsigned cap = boCap * 2 > kMaxBoHandles ? kMaxBoHandles : boCap * 2;
+    Bo **fresh = IONewZero(Bo *, cap);
+    if (!fresh) return kMaxBoHandles;
+    memcpy(fresh, bos, boCap * sizeof(Bo *));
+    IODelete(bos, Bo *, boCap);
+    bos = fresh;
+    boCap = cap;
+    printf("mali: %s: buffer handle table grown to %u\n", ownerName, cap);
+  }
+}
+
+static unsigned boSizeClass(size_t size) {
+  return size <= 0x1000 ? 0 : size <= 0x4000 ? 1 : size <= 0x10000 ? 2 : size <= 0x40000 ? 3 : size <= 0x200000 ? 4 : 5;
+}
+
+// mali-bo-trace=1: one line per group submit of the render server that has buffer objects made or freed since the last (about 20 of the render
+// server's frames a second at the App Library): "+64" is a BO of 64 KiB made, "-4" one of 4 KiB freed. 0 (the default) prints nothing.
+// It starts once the render server holds 480 handles (the lock screen at rest has about 440) and stops after 12000 events.
+static bool boTraceWanted(const char *owner, unsigned live) {
+  static unsigned on = 99, events;
+  if (on == 99) { unsigned v = 0; PE_parse_boot_argn("mali-bo-trace", &v, sizeof v); on = v ? 1 : 0; }
+  return on && live >= 480 && events < 12000 && strcmp(owner, "backboardd") == 0 && (++events, true);
+}
+
+void MaliClient::boTraceFlush() {
+  if (!boTraceLen) return;
+  printf("mali: bo trace %s submit %llu live %u:%s\n", ownerName, (unsigned long long)boSubmits, boLive, boTrace);
+  boTraceLen = 0;
+  boTrace[0] = 0;
+}
+
+void MaliClient::boAdded(const Bo *bo) {
+  ++boLive;
+  ++boClass[boSizeClass(bo->size)];
+  if (boLive >= boNextReport) {
+    printf("mali: %s holds %u buffer handles (%llu MiB of its own, %llu MiB over its own pages; <=4K %u <=16K %u <=64K %u <=256K %u <=2M %u more %u; table %u, submits %llu)\n",
+           ownerName, boLive, (unsigned long long)(boLiveBytes >> 20), (unsigned long long)(boHostBytes >> 20), boClass[0], boClass[1], boClass[2], boClass[3], boClass[4], boClass[5],
+           boCap, (unsigned long long)boSubmits);
+    boNextReport += boNextReport < 4096 ? 1024 : 2048;
+  }
+  if (boTraceLen + 12 >= sizeof boTrace) boTraceFlush();
+  if (boTraceWanted(ownerName, boLive))
+    boTraceLen += snprintf(boTrace + boTraceLen, sizeof boTrace - boTraceLen, " +%llu%s", (unsigned long long)(bo->size >> 10), bo->host ? "h" : "");
+}
+
+void MaliClient::boRemoved(const Bo *bo) {
+  if (boLive) --boLive;
+  if (boClass[boSizeClass(bo->size)]) --boClass[boSizeClass(bo->size)];
+  if (boTraceLen + 12 >= sizeof boTrace) boTraceFlush();
+  if (boTraceWanted(ownerName, boLive + 1))
+    boTraceLen += snprintf(boTrace + boTraceLen, sizeof boTrace - boTraceLen, " -%llu", (unsigned long long)(bo->size >> 10));
 }
 
 void MaliClient::releaseAll() {
@@ -2149,8 +2225,10 @@ void MaliClient::releaseAll() {
     if (gGroup[g].used && gGroup[g].owner == this) groupDestroy(&gGroup[g]);
   for (unsigned i = 0; i < kMaxCtx; ++i)
     if (gCtx[i].used && gCtx[i].owner == this) ctxDestroy(&gCtx[i]);
-  for (unsigned h = 0; bos && h < kMaxBoHandles; ++h)
+  for (unsigned h = 0; bos && h < boCap; ++h)
     if (bos[h]) { boRelease(bos[h]); bos[h] = nullptr; }
+  boLive = 0;
+  memset(boClass, 0, sizeof boClass);
   IOLockUnlock(gLock);
 }
 
@@ -2162,7 +2240,7 @@ IOReturn MaliClient::clientClose() {
 
 void MaliClient::free() {
   releaseAll();
-  if (bos) { IODelete(bos, Bo *, kMaxBoHandles); bos = nullptr; }
+  if (bos) { IODelete(bos, Bo *, boCap); bos = nullptr; boCap = 0; }
   IOUserClient::free();
 }
 
@@ -2427,12 +2505,16 @@ IOReturn MaliClient::dispatch(uint32_t selector, const uint8_t *in, uint32_t inS
     case MALI_BO_CREATE: {
       NEED_IN(mali_bo_create_in, i);
       if (!i.size || i.size > (1ull << 32)) return kIOReturnBadArgument;
-      unsigned h = 0;
-      while (h < kMaxBoHandles && bos[h]) ++h;
-      if (h == kMaxBoHandles) return kIOReturnNoResources;
+      const unsigned h = boSlot();
+      if (h == kMaxBoHandles) {
+        static unsigned full;
+        if (full++ < 8) printf("mali: %s: buffer refused: all %u handles in use (live %u, %llu MiB)\n", ownerName, kMaxBoHandles, boLive, (unsigned long long)(boLiveBytes >> 20));
+        return kIOReturnNoResources;
+      }
       Bo *bo = boCreate(static_cast<size_t>(i.size), this);
       if (!bo) return kIOReturnNoMemory;
       bos[h] = bo;
+      boAdded(bo);
       boCreated++;
       if (bo->size >= (4ull << 20)) {   // what a client's memory is made of: the big ones, by process and handle (the first few dozen)
         static unsigned big;
@@ -2452,8 +2534,7 @@ IOReturn MaliClient::dispatch(uint32_t selector, const uint8_t *in, uint32_t inS
     }
     case MALI_BO_CREATE_HOST: {
       NEED_IN(mali_bo_create_host_in, i);
-      unsigned h = 0;
-      while (h < kMaxBoHandles && bos[h]) ++h;
+      const unsigned h = boSlot();
       if (h == kMaxBoHandles) { printf("mali: host bo refused: all %u handles in use\n", (unsigned)kMaxBoHandles); return kIOReturnNoResources; }
       if (!i.size || (i.ptr | i.size) & 0xfff || i.size > (1ull << 30)) {
         printf("mali: host bo refused by the call: ptr %#llx size %#llx\n", (unsigned long long)i.ptr, (unsigned long long)i.size);
@@ -2462,6 +2543,7 @@ IOReturn MaliClient::dispatch(uint32_t selector, const uint8_t *in, uint32_t inS
       Bo *bo = boCreateHost(ownerTask, i.ptr, i.size, this);
       if (!bo) return kIOReturnNoMemory;
       bos[h] = bo;
+      boAdded(bo);
       boHostBytes += bo->size;
       mali_bo_create_out o = {h + 1, 0, bo->size};
       PUT_OUT(mali_bo_create_out, o);
@@ -2473,6 +2555,8 @@ IOReturn MaliClient::dispatch(uint32_t selector, const uint8_t *in, uint32_t inS
       if (!bo) return kIOReturnBadArgument;
       if (!bo->host && !bo->hostCopy) boLiveBytes -= bo->size;
       bos[i.handle - 1] = nullptr;
+      if (i.handle - 1 < boScan) boScan = i.handle - 1;
+      boRemoved(bo);
       boRelease(bo);
       return kIOReturnSuccess;
     }
@@ -2537,6 +2621,8 @@ IOReturn MaliClient::dispatch(uint32_t selector, const uint8_t *in, uint32_t inS
       if (act > 0) return kIOReturnNotReady;   // every slot has a busy group in it: externalMethod waits and calls again
       if (act < 0) return kIOReturnNoResources;
       if (!groupSubmit(*g, i.queue, i.cs_va, i.cs_size, i.latest_flush, &o.seqno)) return kIOReturnNoSpace;
+      ++boSubmits;
+      boTraceFlush();
       PUT_OUT(mali_group_submit_out, o);
       return kIOReturnSuccess;
     }
