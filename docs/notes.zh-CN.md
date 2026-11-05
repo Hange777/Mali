@@ -123,7 +123,7 @@ m2b PASSED: a shader ran on the shader cores and wrote memory
 - `Ctx`（一个地址空间，页表池可增长到 16 MB）、`Group`（一个 CSG 槽 + 最多 4 条队列，每条队列的环形缓冲和 group 的 syncobj 页都在 ctx 里的内核 VA 区）、
   `groupSubmit()`（**照 Panthor `prepare_job_instrs()` 逐条搭**：`MOV32 flush_id / FLUSH_CACHE2.clean_inv_all / MOV48 cs.start / MOV32 cs.size / WAIT(0) / CALL / MOV48 sync / MOV48 1 / WAIT(all) / SYNC_ADD64 / ERROR_BARRIER`，补到 16 条＝128 字节）、
   `groupWait()`（队列的 syncobj 计数 ≥ 作业序号即完成）。
-- MCU 侧的每槽资源（四条队列的输入/输出页、suspend 缓冲）第一次用时分配、之后复用；group 销毁 = CSG_REQ 置 TERMINATE(0) + 全局门铃，等 ack，再把每个 CS 置 STOP。
+- MCU 侧的每槽资源（四条队列的输入/输出页、suspend 缓冲）第一次用时分配、之后复用；group 销毁 = CSG_REQ 置 TERMINATE(0) + 全局门铃，等 ack，再把每个 CS 置 STOP。（**2026-11-05 起这些资源是 group 自己的、group 被逐出槽位用 SUSPEND 而不是 TERMINATE**，见文末「CSG 被逐出」一节。）
 - 实测：一个 group 三条队列各跑一次 job ✓；40 个 job 过 4 KiB 环（128 B 一个，环绕）✓；20 个 job 排队只等最后一个栅栏 ✓；
   两个 context + 两个 group 同时在（**同一个 VA、不同的物理内存，互不串**）✓；销毁第一个，第二个照常；再建一个落在被释放的槽 0 / AS1 上 ✓。
 - 顺带量到：`CS_FEATURES = 0x7085f`（96 个寄存器、8 个 scoreboard、compute+fragment+tiler）；`allowFragment` 填满着色器核也被固件接受。
@@ -307,6 +307,38 @@ VOP 的窗口地址翻到这个面——面板扫到画了一半的面。`up3` �
 3. Panthor 依赖的 Linux 设施（DRM/GEM/dma_fence/io-pgtable/调度器）在 XNU 上都要自己写。
 4. 电压/时钟：驱动自己的默认是 198 MHz（没有 `mali-pll` 参数时），`UniXNU-evb10` 的 `board.toml` 默认是 750 MHz（UEFI 的 0.75 V）；1 GHz 要 0.85 V 的固件（`GPU_RAIL_UV`）；SCMI 调频没做。
 5. 对 G610 的缓存一致性：先按「非一致」处理（CPU 侧共享缓冲用 Write-Combine）。
+
+## CSG 被逐出：用 SUSPEND，不要 TERMINATE（2026-11-05，Orange Pi 5 上定位并修复）
+
+**现象**（EVB10 和 Orange Pi 5 都有，开机后约 80 s、290 s、400 s 不等）：一行 `MMU page fault in ASn (a client's): status 0x7cc002c1 address 0`，接着
+`group N did NOT terminate (req 0 ack 0x30000001)`、`STALL group …`，之后所有提交都不再完成：backboardd 空转，画面不再换帧（锁屏的时钟停在 4:05）、指针不动。
+`status 0x7cc002c1` = 转换错误（第 1 级）、读访问；地址 0。
+
+**怎么找到的**（OPi5 板上，`gpu1`，加了 `jobDump()` 之后）：
+- 故障前最后几行是 `AS3 enabled …` 和 `group 1 in slot 4: address space 3`：**backboardd 的 group 1 刚被重新放进一个槽位**（它第一次起是在槽位 0）。
+  **全部 10 份带 `MMU page fault` 的串口日志（OPi5 七份、EVB10 三份）都是这样：第一次故障在 0.5 s 之内紧跟在一个「已经起过的 group」的第二次 `in slot` 之后**
+  （OPi5 的 vop1 78.5 s、dvfsusb3 81.8 s、sb16 81.2 s、gpu1 402.5 s；EVB10 的 tb1 294.9 s、tg1 291.3 s、wifi11 286.1 s；没有一份例外）。
+- 卡住的作业的环（`JOB … ring` 行，是内核自己搭的 16 条指令）正常：`MOV48 addr,0xff190000 / MOV32 size,0xd00 / WAIT / CALL`，固件的 extract 停在 CALL 那一条（`+0x28`）。
+  出错的访问地址是 0，不是用户流的地址：错在用户命令流**里面**读了一个从寄存器取的指针。
+- 逐出走的是 `groupEvictIdle()` → `groupStop()`：CSG_REQ 置 **TERMINATE**，再放回槽位时 **START**，suspend 缓冲和队列接口页都清零。**队列的寄存器全被清零。**
+  Mesa 的 PanVK 在一条队列的第一个作业里一次性设好寄存器（子队列上下文、scoreboard、tiler 指针等），之后的命令流只用不设；Panthor 的逐出是 SUSPEND，固件把寄存器存进
+  group 自己的 suspend 缓冲，放回时 RESUME，用户态才能这么写。清零之后第一个用到那些寄存器的 load 读的就是地址 0。
+- 故障之后固件再也不响应 TERMINATE（`did NOT terminate`），占着的槽位让其他 group 也起不来，所以整个 GPU 停了。
+  （文件里别处「STALL 在 19 / 48 份旧日志里出现」有相当一部分不是这个：旧的 `gpuStallScan()` 对一直在提交的 group 也会报，现在只报「两次扫描之间一个作业都没完成」的。）
+
+**修法**（`Mali.cpp`）：
+- `HwRes`：队列的输入/输出页和 suspend / protm suspend 缓冲不再属于槽位，而属于 group（Panthor 的 `queue->iface`、`group->suspend_buf`），从池里取、group 销毁后还回去（MCU 的 VA 只发不收，所以池只增长到同时存在的 group 数）。
+- `groupStop(g, suspend)`：被逐出时请求 `CSG_STATE_SUSPEND`（2），等 ack；`g.suspended = true`。固件不应答（或已变成 TERMINATE）才退回 TERMINATE，并打 `did NOT suspend`。
+- `groupStart()`：`g.suspended` 时不清页、不重设 extract，请求 `CSG_STATE_RESUME`（3）；CS 照旧发 START（Panthor 的 `cs_slot_prog_locked` 也是）。
+- 销毁仍是 TERMINATE。只逐出空闲的 group（`groupIdle()`），这一点没变；忙的 group 不逐出，所以这次没用到「在作业中途挂起」。
+
+**板上结果**（OPi5，`gpu5`，不动鼠标，没有鼠标演示）：开机后 308–318 s 那一波海报扩展起了十几个 group，backboardd 的 group 1 在 309.039 s 被放回槽位 4（地址空间 3）——
+就是旧驱动里 402.5 s 出故障的那一步——group 11、12、14 也换了槽位；**没有 MMU 故障、没有 `did NOT suspend`、没有 `STALL`、backboardd 没有退出**，日志到 855 s（还在跑）；时钟一直在走（4:09 对应约 570 s，换帧计数继续增加）。
+旧驱动在同样的开机里（`gpu1`）402.5 s 出故障后再也没有换帧。
+
+**没验证**：EVB10（共用这个文件，这次没在 EVB10 上跑）；长时间（只看了 14 分钟，一个开机）；忙 group 的逐出；寄存器清零是原因这一点没有直接读寄存器验证（证据是上面的现象和改后同一事件不再出错）。
+**新现象，没查**：那一波之后，锁屏时钟的数字（backboardd 合成的、SpringBoard 用 CPU 画的文字层）带横向的虚线噪点（`gpu5` 的 4:08、4:09），波之前的 4:03 基本干净（有一条细虚线）。
+那一波里 BO 池几乎用满（`pool 205 of 256 granules in use (peak 253)`，之后 `pool 249 … peak 254`，**26 个缓冲池里放不下**、走了池外的页），可能相关；也可能是文字位图的缓存行没清到内存。都只是猜测，没验证。
 
 ## 工具
 
