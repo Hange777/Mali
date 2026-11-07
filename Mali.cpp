@@ -2939,8 +2939,12 @@ extern "C" int mali_gpu_addon(const uint8_t **data, uint64_t *bytes) {
   return 1;
 }
 
+// The test program of another driver follows the owner's (Rk3588Vdec's VideoToolbox test, scripts/data/Rk3588Vdec/usertest of the SoC repository). This weak
+// definition is the answer of a kernel that does not carry it; with no gpu_files.inc, that program is the first file and so the init process.
+extern "C" __attribute__((weak)) int vdec_test_file(unsigned, const char **, const uint8_t **, size_t *, size_t *) { return -1; }
+
 extern "C" int mali_test_file(unsigned index, const char **name, const uint8_t **data, size_t *size, size_t *rawSize) {
-  if (index >= kTestFileCount) return -1;
+  if (index >= kTestFileCount) return vdec_test_file(index - kTestFileCount, name, data, size, rawSize);
   *name = kTestFiles[index].name;
   *data = kTestFiles[index].data;
   *size = kTestFiles[index].size;
