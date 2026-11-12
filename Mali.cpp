@@ -2051,6 +2051,7 @@ class MaliClient : public IOUserClient {
   unsigned boTraceLen = 0;
   bool closed = false;
   char ownerName[17] = {};         // what the process is called, for the line the connection leaves when it closes
+  int ownerPid = 0;                // its pid, for the user-message relay below: the Metal plugin's lines are signed
   uint64_t boLiveBytes = 0, boPeakBytes = 0, boHostBytes = 0, boCreated = 0;   // what it asked for: a process under a memory limit is killed for its footprint
 
   Bo *boFor(uint32_t handle) { return (bos && handle && handle <= boCap) ? bos[handle - 1] : nullptr; }
@@ -2126,6 +2127,9 @@ void fillInfo(mali_dev_info &i) {
 }  // namespace
 
 extern "C" void proc_selfname(char *buf, int size);
+// The pid of a client's task, the same pair LegacyDisplayProbe.cpp includes and reads for the framebuffer clients.
+#include <kern/task.h>
+#include <sys/proc.h>
 
 IOReturn MaliService::newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) {
   if (!handler) return kIOReturnBadArgument;
@@ -2151,6 +2155,7 @@ bool MaliClient::initWithTask(task_t owningTask, void *securityToken, UInt32 typ
   if (!IOUserClient::initWithTask(owningTask, securityToken, type)) return false;
   ownerTask = owningTask;
   proc_selfname(ownerName, sizeof ownerName);
+  ownerPid = owningTask ? proc_pid((proc_t)get_bsdtask_info(owningTask)) : 0;
   bos = IONewZero(Bo *, kBoHandlesStart);
   boCap = bos ? kBoHandlesStart : 0;
   return bos != nullptr;
@@ -2529,7 +2534,10 @@ IOReturn MaliClient::dispatch(uint32_t selector, const uint8_t *in, uint32_t inS
     case MALI_LOG: {
       NEED_IN(mali_log_in, i);
       i.text[sizeof i.text - 1] = 0;
-      printf("mali: user: %s\n", i.text);
+      // The relay line now names the sender: the Metal plugin's rows (`mali: user: msg N:`, the degrade
+      // decisions and the Vulkan failures among them) belong to a process, and the white squares ask which
+      // one said "A8Unorm ... 332x200 ... rows 352 ... ERROR_INITIALIZATION_FAILED".
+      printf("mali: user: %s[%d]: %s\n", ownerName, ownerPid, i.text);
       return kIOReturnSuccess;
     }
     case MALI_BO_CREATE_HOST: {
